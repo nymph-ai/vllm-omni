@@ -1,0 +1,37 @@
+# dots.tts deploy (V1 skeleton).
+#
+# V1 骨架阶段所有"优化旋钮"关闭。等 §5.1 路径走到第 7-8 步再逐项打开。
+# 对照 voxcpm2.yaml 看哪些字段未来要加。
+#
+# Verified locally on RTX 5080 16GB(skeleton load only).
+
+async_chunk: false
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 4                 # V1 先单并发 → 后续 §5.1 step 5 加 _RequestState 后再调
+    gpu_memory_utilization: 0.8
+    enforce_eager: true             # V1 不抓 CUDA Graph
+    trust_remote_code: true
+    enable_prefix_caching: false
+    async_scheduling: true
+    max_num_batched_tokens: 4096
+    max_model_len: 4096
+    devices: "0"
+    engine_extras:
+      hf_overrides:
+        dots_tts_runtime_config:
+          # V1 全部保守值,等功能跑通后再优化(对照 voxcpm2.yaml 的 voxcpm2_runtime_config)
+          audio_emit_every: 1
+          vae_decode_every: 1
+          enable_batched_meanflow: false
+          enable_batched_vae_decode: false
+          coalesce_audio_d2h: false
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 4096
+      seed: 42
+      repetition_penalty: 1.0
