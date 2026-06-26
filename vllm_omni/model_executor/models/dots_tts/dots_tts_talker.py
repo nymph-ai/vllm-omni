@@ -984,8 +984,11 @@ class DotsTTSForConditionalGeneration(nn.Module):
                         logits[i, 0] = 0.0
                         logits[i, 1] = 1.0
                     else:
-                        logits[i, 0] = stop_logits[0, 0]
-                        logits[i, 1] = stop_logits[0, 1]
+                        # is_stopping=False 等价于 prob_stop ≤ 0.8 — 强制
+                        # continue. 不能直接喂 raw softmax (continue, stop) 当
+                        # logits, 否则 greedy sampler 直接比大小, 实际有效阈值
+                        # 降到 0.5, 模型早停拽不住, 表现为多余尾音 / 后半段退化.
+                        logits[i, 0] = 1.0
                     if state is not None:
                         state.precomputed_stop_logits = None
                 else:

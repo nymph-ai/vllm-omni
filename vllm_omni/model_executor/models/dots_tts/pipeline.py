@@ -33,8 +33,12 @@ DOTS_TTS_PIPELINE = PipelineConfig(
             engine_output_type="audio",
             sampling_constraints={
                 "detokenize": False,
-                # Qwen2.5 EOS = 151643; refine once real checkpoint loads.
-                "stop_token_ids": [151643],
+                # Stop signal slot in compute_logits (voxcpm2 convention —
+                # talker emits logits[i, 1] = 1.0 when prob_stop > 0.8, vLLM
+                # matches against this list to terminate the request).  Not
+                # Qwen2.5 EOS (151643) — that ID would never come out of the
+                # 2-slot continue/stop softmax our compute_logits builds.
+                "stop_token_ids": [1],
             },
         ),
     ),
