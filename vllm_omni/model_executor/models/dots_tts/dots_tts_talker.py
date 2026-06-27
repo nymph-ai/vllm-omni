@@ -368,19 +368,23 @@ class DotsTTSForConditionalGeneration(nn.Module):
         # latent_stats.pt sitting next to the checkpoint files).  Used by
         # _finish_decode to bridge between DiT's normalized latent space and
         # the raw latent space expected by patch_encoder + AudioVAE.
-        latent_stats_path = os.path.join(
-            vllm_config.model_config.model, "latent_stats.pt"
+        latent_stats_path = self._resolve_latent_stats_path(
+            vllm_config.model_config.model
         )
-        if os.path.exists(latent_stats_path):
+        if latent_stats_path is not None:
             self._io_helper = _IOHelper(latent_stats_path)
         else:
             logger.warning(
-                "latent_stats.pt not found under %s; running with identity "
-                "normalize/denormalize (raw == normalized).  Wav quality "
-                "will be wrong until checkpoint supplies it.",
+                "latent_stats.pt not resolvable for %s; running with "
+                "identity normalize/denormalize.  Wav will be ~10x quiet "
+                "and distorted (no sqrt(var) denormalize).",
                 vllm_config.model_config.model,
             )
             self._io_helper = _IOHelper()
+
+        # (β) diagnostic: per-patch rms/max log, env-gated.  Remove once
+        # the first-N-patch wav burst is localized.
+        self._beta_trace = bool(os.environ.get("DOTS_TTS_BETA_TRACE"))
 
         # Step 7a state plumbing — see notes §6.2.
         # _active_states: per-request state keyed by request_id (created in
@@ -456,6 +460,31 @@ class DotsTTSForConditionalGeneration(nn.Module):
         return output
 
     # ── vllm-omni contract stubs (real impls land in step 3+) ──
+
+    @staticmethod
+    def _resolve_latent_stats_path(model_arg: str) -> str | None:
+        """Resolve latent_stats.pt to a local filesystem path.
+
+        ``vllm_config.model_config.model`` is typically an HF repo ID like
+        ``"rednote-hilab/dots.tts-soar"`` — joining it with ``"latent_
+        stats.pt"`` gives a non-existent path.  Try the local-dir form
+        first (covers ``--model /local/path``), then fall back to HF
+        cache lookup with ``local_files_only=True`` so we never trigger
+        a download from this side (the file was fetched alongside the
+        safetensors at load time).
+        """
+        local = os.path.join(model_arg, "latent_stats.pt")
+        if os.path.exists(local):
+            return local
+        try:
+            from huggingface_hub import hf_hub_download
+            return hf_hub_download(
+                repo_id=model_arg,
+                filename="latent_stats.pt",
+                local_files_only=True,
+            )
+        except Exception:
+            return None
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         """Map token ids to embeddings via the base LM's embed_tokens.
@@ -600,6 +629,21 @@ class DotsTTSForConditionalGeneration(nn.Module):
 
         # 1. Append last LLM hidden to fm_sequence (+1 position).
         last_hidden = req_hidden[-_HIDDEN_PATCH_SIZE:].unsqueeze(0)
+
+        # === DOTS_TTS_HIDDEN_DUMP patch (vllm-omni regression diff) ===
+        _dump_dir = os.environ.get("DOTS_TTS_HIDDEN_DUMP")
+        if _dump_dir:
+            os.makedirs(_dump_dir, exist_ok=True)
+            _idx = getattr(self, "_dump_idx", 0)
+            torch.save({
+                "hidden": last_hidden.detach().cpu().float(),
+                "shape": list(last_hidden.shape),
+                "dtype": str(last_hidden.dtype),
+                "is_prefill": is_prefill,
+            }, f"{_dump_dir}/step_{_idx:04d}.pt")
+            self._dump_idx = _idx + 1
+        # === end patch ===
+
         self._append_hidden_chunk(state, last_hidden)
 
         # 2. DiT N-step Euler → audio latent patch [1, 4, 128] (normalized).
@@ -619,6 +663,13 @@ class DotsTTSForConditionalGeneration(nn.Module):
         # 6-7 (TBD 7e-r3b/c): VAE decode, real eos_proj → real wav + stop signal.
 
         if is_prefill:
+            if self._beta_trace:
+                self._beta_trace_log(
+                    state, is_prefill=True,
+                    last_hidden=last_hidden, audio_patch=audio_patch,
+                    audio_patch_raw=audio_patch_raw, next_embeds=next_embeds,
+                    wav=None, prob_stop=None,
+                )
             state.prefill_completed = True
             return
 
@@ -645,6 +696,53 @@ class DotsTTSForConditionalGeneration(nn.Module):
         if eos_logits[0, -1, 1].item() > 0.8:
             state.is_stopping = True
         self._results_queue.append((req_id, stop_logits))
+
+        if self._beta_trace:
+            self._beta_trace_log(
+                state, is_prefill=False,
+                last_hidden=last_hidden, audio_patch=audio_patch,
+                audio_patch_raw=audio_patch_raw, next_embeds=next_embeds,
+                wav=wav, prob_stop=eos_logits[0, -1, 1].item(),
+            )
+
+    def _beta_trace_log(
+        self,
+        state: _RequestState,
+        *,
+        is_prefill: bool,
+        last_hidden: torch.Tensor,
+        audio_patch: torch.Tensor,
+        audio_patch_raw: torch.Tensor,
+        next_embeds: torch.Tensor,
+        wav: torch.Tensor | None,
+        prob_stop: float | None,
+    ) -> None:
+        """(β) diagnostic — patch label matches output.wav indexing in
+        decode rows; prefill row labels itself ``pre``."""
+        def rmsmax(t: torch.Tensor) -> tuple[float, float]:
+            f = t.detach().float()
+            return f.pow(2).mean().sqrt().item(), f.abs().max().item()
+
+        patch_label = "pre" if is_prefill else f"{state.fm_seq_len // 5 - 2:2d}"
+        req_tail = state.request_id[-8:]
+        hid_rms, hid_max = rmsmax(last_hidden)
+        dit_rms, dit_max = rmsmax(audio_patch)
+        raw_rms, raw_max = rmsmax(audio_patch_raw)
+        nxt_rms, nxt_max = rmsmax(next_embeds)
+        if wav is not None:
+            w_rms, w_max = rmsmax(wav)
+            wav_part = f"wav:rms={w_rms:.3f} max={w_max:.3f}"
+        else:
+            wav_part = "wav:rms=  -   max=  -  "
+        stop_part = f"stop={prob_stop:.3f}" if prob_stop is not None else "stop=  -  "
+        logger.info(
+            f"[β req={req_tail} patch={patch_label}] "
+            f"hid:rms={hid_rms:.3f} max={hid_max:.3f} | "
+            f"dit:rms={dit_rms:.3f} max={dit_max:.3f} | "
+            f"raw:rms={raw_rms:.3f} max={raw_max:.3f} | "
+            f"next:rms={nxt_rms:.3f} max={nxt_max:.3f} | "
+            f"{wav_part} | {stop_part}"
+        )
 
     # ── Step 7e-r1 helpers (per-request FM workspace + DiT N-step Euler) ──
 
@@ -941,9 +1039,46 @@ class DotsTTSForConditionalGeneration(nn.Module):
                     audio_by_req[req_id] = audio
             if audio_by_req:
                 sr = torch.tensor(self._sample_rate, dtype=torch.int32)
-                mm["model_outputs"] = list(audio_by_req.values())
-                mm["sr"] = [sr for _ in audio_by_req]
+                ready_req_ids = list(audio_by_req)
+                chunks = [audio_by_req[req_id].reshape(-1) for req_id in ready_req_ids]
+                mm["model_outputs"] = chunks
+                mm["sr"] = [sr for _ in ready_req_ids]
+                # sparse_audio: ["1"] flags GPUARModelRunner to skip the default
+                # payload["hidden"] = scaffold_hidden injection (gpu_ar_model_
+                # runner.py:1114).  Otherwise prefill scaffold (24 hidden × 1536
+                # = 29184 numbers observed) leaks into mm["audio"] via the
+                # output_processor "hidden" → target_key="audio" rename
+                # (output_processor.py:84), prepending ~0.61 s of noise.
+                mm["meta"] = {"req_id": ready_req_ids, "sparse_audio": ["1"]}
             self._audio_queue.clear()
+        else:
+            # Empty-audio step (prefill) still needs the sparse marker so the
+            # engine doesn't bleed scaffold_hidden into mm["audio"].
+            mm["model_outputs"] = []
+            mm["sr"] = []
+            mm["meta"] = {"req_id": [], "sparse_audio": ["1"]}
+
+        if self._beta_trace:
+            payload = mm.get("model_outputs")
+            if payload:
+                for i, t in enumerate(payload):
+                    logger.info(
+                        f"[β-emit] mm[model_outputs][{i}]: shape={tuple(t.shape)} "
+                        f"dtype={t.dtype} samples={t.numel()} "
+                        f"rms={t.float().pow(2).mean().sqrt().item():.4f} "
+                        f"max={t.abs().max().item():.4f}"
+                    )
+            else:
+                logger.info("[β-emit] mm empty / no model_outputs")
+            mo_kind = type(model_outputs).__name__
+            mo_info = (
+                f"shape={tuple(model_outputs.shape)}"
+                if hasattr(model_outputs, "shape")
+                else "no_shape"
+            )
+            logger.info(
+                f"[β-emit] text_hidden_states arg: {mo_kind} {mo_info}"
+            )
 
         return OmniOutput(text_hidden_states=model_outputs, multimodal_outputs=mm)
 
