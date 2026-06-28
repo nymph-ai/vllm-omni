@@ -37,7 +37,6 @@ from torch import pow, sin
 from torch.nn import Parameter
 from torch.nn.utils import remove_weight_norm, weight_norm
 
-
 # ============================================================================
 # Configuration (adapted from modules/vocoder/config.py)
 # ----------------------------------------------------------------------------
@@ -150,9 +149,7 @@ class ConvTranspose1d(nn.ConvTranspose1d):
             padding = 0 if causal else (kernel_size - stride) // 2
         if causal:
             assert padding == 0, "padding is not allowed in causal ConvTranspose1d."
-            assert kernel_size == 2 * stride, (
-                "kernel_size must be equal to 2*stride in Causal ConvTranspose1d."
-            )
+            assert kernel_size == 2 * stride, "kernel_size must be equal to 2*stride in Causal ConvTranspose1d."
 
         super().__init__(
             in_channels,
@@ -189,6 +186,7 @@ class ConvTranspose1d(nn.ConvTranspose1d):
 if "sinc" in dir(torch):
     sinc = torch.sinc
 else:
+
     def sinc(x: torch.Tensor):
         """
         Implementation of sinc, i.e. sin(pi * x) / (pi * x)
@@ -201,9 +199,7 @@ else:
         )
 
 
-def kaiser_sinc_filter1d(
-    cutoff, half_width, kernel_size
-):  # return filter [1,1,kernel_size]
+def kaiser_sinc_filter1d(cutoff, half_width, kernel_size):  # return filter [1,1,kernel_size]
     even = kernel_size % 2 == 0
     half_size = kernel_size // 2
 
@@ -279,9 +275,7 @@ class LowPassFilter1d(nn.Module):
         if self.padding:
             x = F.pad(x, (self.pad_left, self.pad_right), mode=self.padding_mode)
         if self.fixed_filter:
-            out = F.conv1d(
-                x, self.filter.expand(C, -1, -1), stride=self.stride, groups=C
-            )
+            out = F.conv1d(x, self.filter.expand(C, -1, -1), stride=self.stride, groups=C)
         else:
             out = F.conv1d(x, self.filter, stride=self.stride, groups=C)
         return out
@@ -295,14 +289,10 @@ class LowPassFilter1d(nn.Module):
 
 
 class UpSample1d(nn.Module):
-    def __init__(
-        self, ratio=2, kernel_size=None, channels=None, causal=True, fixed_filter=False
-    ):
+    def __init__(self, ratio=2, kernel_size=None, channels=None, causal=True, fixed_filter=False):
         super().__init__()
         self.ratio = ratio
-        self.kernel_size = (
-            int(6 * ratio // 2) * 2 if kernel_size is None else kernel_size
-        )
+        self.kernel_size = int(6 * ratio // 2) * 2 if kernel_size is None else kernel_size
         self.stride = ratio
         self.channels = channels
         self.causal = causal
@@ -311,15 +301,9 @@ class UpSample1d(nn.Module):
             self.pad = 0
         else:
             self.pad = self.kernel_size // ratio - 1
-            self.pad_left = (
-                self.pad * self.stride + (self.kernel_size - self.stride) // 2
-            )
-            self.pad_right = (
-                self.pad * self.stride + (self.kernel_size - self.stride + 1) // 2
-            )
-        filter = kaiser_sinc_filter1d(
-            cutoff=0.5 / ratio, half_width=0.6 / ratio, kernel_size=self.kernel_size
-        )
+            self.pad_left = self.pad * self.stride + (self.kernel_size - self.stride) // 2
+            self.pad_right = self.pad * self.stride + (self.kernel_size - self.stride + 1) // 2
+        filter = kaiser_sinc_filter1d(cutoff=0.5 / ratio, half_width=0.6 / ratio, kernel_size=self.kernel_size)
         if self.fixed_filter:
             self.register_buffer("filter", filter)
         else:
@@ -330,13 +314,9 @@ class UpSample1d(nn.Module):
         _, C, _ = x.shape
         x = F.pad(x, (self.pad, self.pad), mode="replicate")
         if self.fixed_filter:
-            x = self.ratio * F.conv_transpose1d(
-                x, self.filter.expand(C, -1, -1), stride=self.stride, groups=C
-            )
+            x = self.ratio * F.conv_transpose1d(x, self.filter.expand(C, -1, -1), stride=self.stride, groups=C)
         else:
-            x = self.ratio * F.conv_transpose1d(
-                x, self.filter, stride=self.stride, groups=C
-            )
+            x = self.ratio * F.conv_transpose1d(x, self.filter, stride=self.stride, groups=C)
         if self.causal:
             x = x[..., : -(self.kernel_size - self.stride)]
         else:
@@ -346,14 +326,10 @@ class UpSample1d(nn.Module):
 
 
 class DownSample1d(nn.Module):
-    def __init__(
-        self, ratio=2, kernel_size=None, channels=None, causal=True, fixed_filter=False
-    ):
+    def __init__(self, ratio=2, kernel_size=None, channels=None, causal=True, fixed_filter=False):
         super().__init__()
         self.ratio = ratio
-        self.kernel_size = (
-            int(6 * ratio // 2) * 2 if kernel_size is None else kernel_size
-        )
+        self.kernel_size = int(6 * ratio // 2) * 2 if kernel_size is None else kernel_size
         self.lowpass = LowPassFilter1d(
             cutoff=0.5 / ratio,
             half_width=0.6 / ratio,
@@ -425,9 +401,7 @@ class Snake(nn.Module):
         - alpha - trainable parameter
     """
 
-    def __init__(
-        self, in_features, alpha=1.0, alpha_trainable=True, alpha_logscale=False
-    ):
+    def __init__(self, in_features, alpha=1.0, alpha_trainable=True, alpha_logscale=False):
         super().__init__()
         self.in_features = in_features
 
@@ -462,9 +436,7 @@ class SnakeBeta(nn.Module):
         - beta - trainable parameter that controls magnitude
     """
 
-    def __init__(
-        self, in_features, alpha=1.0, alpha_trainable=True, alpha_logscale=False
-    ):
+    def __init__(self, in_features, alpha=1.0, alpha_trainable=True, alpha_logscale=False):
         super().__init__()
         self.in_features = in_features
 
@@ -506,7 +478,7 @@ class SnakeBeta(nn.Module):
 @dataclass(slots=True)
 class BigVGANStreamState:
     lstm_hidden: tuple[torch.Tensor, torch.Tensor]
-    decoder: "DecoderStreamState"
+    decoder: DecoderStreamState
 
 
 @dataclass(slots=True)
@@ -515,6 +487,7 @@ class DecoderStreamState:
     chunk_size: int
     total_frames: int = 0
     emitted_frames: int = 0
+
 
 def _empty_chunk(
     ref: torch.Tensor,
@@ -572,7 +545,6 @@ class Conv1d_S(nn.Module):
         groups=1,
         causal=False,
     ):
-
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -626,22 +598,10 @@ class SLSTM(nn.Module):
             batch_first=True,
         )
         self._stream_num_layers = num_layers
-        self._stream_weight_ih = tuple(
-            getattr(self.lstm, f"weight_ih_l{layer_idx}")
-            for layer_idx in range(num_layers)
-        )
-        self._stream_weight_hh = tuple(
-            getattr(self.lstm, f"weight_hh_l{layer_idx}")
-            for layer_idx in range(num_layers)
-        )
-        self._stream_bias_ih = tuple(
-            getattr(self.lstm, f"bias_ih_l{layer_idx}")
-            for layer_idx in range(num_layers)
-        )
-        self._stream_bias_hh = tuple(
-            getattr(self.lstm, f"bias_hh_l{layer_idx}")
-            for layer_idx in range(num_layers)
-        )
+        self._stream_weight_ih = tuple(getattr(self.lstm, f"weight_ih_l{layer_idx}") for layer_idx in range(num_layers))
+        self._stream_weight_hh = tuple(getattr(self.lstm, f"weight_hh_l{layer_idx}") for layer_idx in range(num_layers))
+        self._stream_bias_ih = tuple(getattr(self.lstm, f"bias_ih_l{layer_idx}") for layer_idx in range(num_layers))
+        self._stream_bias_hh = tuple(getattr(self.lstm, f"bias_hh_l{layer_idx}") for layer_idx in range(num_layers))
         if self.bidirectional:
             self.proj_out = nn.Linear(dimension * 2, dimension)
 
@@ -795,16 +755,10 @@ class Encoder(nn.Module):
         ]
 
         # channels: [512, 256, 128, 64], upsample_factors: [5, 2, 2]
-        for (in_c, out_c), down_f in zip(
-            itertools.pairwise(channels), down_sample_factors, strict=True
-        ):
+        for (in_c, out_c), down_f in zip(itertools.pairwise(channels), down_sample_factors, strict=True):
             layers += [
-                Conv1d_S(
-                    in_c, out_c, kernel_size=down_f * 2, stride=down_f, causal=causal
-                ),
-                ResStack(
-                    out_c, stack_kernel_size, stack_dilation_base, stacks, causal=causal
-                ),
+                Conv1d_S(in_c, out_c, kernel_size=down_f * 2, stride=down_f, causal=causal),
+                ResStack(out_c, stack_kernel_size, stack_dilation_base, stacks, causal=causal),
                 nn.LeakyReLU(act_slope, True),
             ]
 
@@ -886,32 +840,16 @@ class AMPBlock1(torch.nn.Module):
 
         self.convs2 = nn.ModuleList(
             [
-                weight_norm(
-                    Conv1d(
-                        channels, channels, kernel_size, 1, dilation=1, causal=causal
-                    )
-                ),
-                weight_norm(
-                    Conv1d(
-                        channels, channels, kernel_size, 1, dilation=1, causal=causal
-                    )
-                ),
-                weight_norm(
-                    Conv1d(
-                        channels, channels, kernel_size, 1, dilation=1, causal=causal
-                    )
-                ),
+                weight_norm(Conv1d(channels, channels, kernel_size, 1, dilation=1, causal=causal)),
+                weight_norm(Conv1d(channels, channels, kernel_size, 1, dilation=1, causal=causal)),
+                weight_norm(Conv1d(channels, channels, kernel_size, 1, dilation=1, causal=causal)),
             ]
         )
         self.convs2.apply(init_weights)
 
-        self.num_layers = len(self.convs1) + len(
-            self.convs2
-        )  # total number of conv layers
+        self.num_layers = len(self.convs1) + len(self.convs2)  # total number of conv layers
 
-        if (
-            activation == "snake"
-        ):  # periodic nonlinearity with snake function and anti-aliasing
+        if activation == "snake":  # periodic nonlinearity with snake function and anti-aliasing
             self.activations = nn.ModuleList(
                 [
                     Activation1d(
@@ -922,9 +860,7 @@ class AMPBlock1(torch.nn.Module):
                     for _ in range(self.num_layers)
                 ]
             )
-        elif (
-            activation == "snakebeta"
-        ):  # periodic nonlinearity with snakebeta function and anti-aliasing
+        elif activation == "snakebeta":  # periodic nonlinearity with snakebeta function and anti-aliasing
             self.activations = nn.ModuleList(
                 [
                     Activation1d(
@@ -959,9 +895,7 @@ class AMPBlock1(torch.nn.Module):
 
 
 class AMPBlock2(torch.nn.Module):
-    def __init__(
-        self, h, channels, kernel_size=3, dilation=(1, 3), activation=None, causal=True
-    ):
+    def __init__(self, h, channels, kernel_size=3, dilation=(1, 3), activation=None, causal=True):
         super().__init__()
         self.h = h
 
@@ -993,9 +927,7 @@ class AMPBlock2(torch.nn.Module):
 
         self.num_layers = len(self.convs)  # total number of conv layers
 
-        if (
-            activation == "snake"
-        ):  # periodic nonlinearity with snake function and anti-aliasing
+        if activation == "snake":  # periodic nonlinearity with snake function and anti-aliasing
             self.activations = nn.ModuleList(
                 [
                     Activation1d(
@@ -1006,9 +938,7 @@ class AMPBlock2(torch.nn.Module):
                     for _ in range(self.num_layers)
                 ]
             )
-        elif (
-            activation == "snakebeta"
-        ):  # periodic nonlinearity with snakebeta function and anti-aliasing
+        elif activation == "snakebeta":  # periodic nonlinearity with snakebeta function and anti-aliasing
             self.activations = nn.ModuleList(
                 [
                     Activation1d(
@@ -1064,9 +994,7 @@ class Decoder(nn.Module):
 
         # transposed conv-based upsamplers. does not apply anti-aliasing
         self.ups = nn.ModuleList()
-        for i, (u, k) in enumerate(
-            zip(h.upsample_rates, h.upsample_kernel_sizes, strict=True)
-        ):
+        for i, (u, k) in enumerate(zip(h.upsample_rates, h.upsample_kernel_sizes, strict=True)):
             self.ups.append(
                 nn.ModuleList(
                     [
@@ -1087,36 +1015,22 @@ class Decoder(nn.Module):
         self.resblocks = nn.ModuleList()
         for i in range(len(self.ups)):
             ch = h.upsample_initial_channel // (2 ** (i + 1))
-            for k, d in zip(
-                h.resblock_kernel_sizes, h.resblock_dilation_sizes, strict=True
-            ):
-                self.resblocks.append(
-                    resblock(h, ch, k, d, activation=h.activation, causal=causal)
-                )
+            for k, d in zip(h.resblock_kernel_sizes, h.resblock_dilation_sizes, strict=True):
+                self.resblocks.append(resblock(h, ch, k, d, activation=h.activation, causal=causal))
 
         # post conv
-        if (
-            h.activation == "snake"
-        ):  # periodic nonlinearity with snake function and anti-aliasing
+        if h.activation == "snake":  # periodic nonlinearity with snake function and anti-aliasing
             activation_post = Snake(ch, alpha_logscale=h.snake_logscale)
-            self.activation_post = Activation1d(
-                activation=activation_post, causal=causal, fixed_filter=False
-            )
-        elif (
-            h.activation == "snakebeta"
-        ):  # periodic nonlinearity with snakebeta function and anti-aliasing
+            self.activation_post = Activation1d(activation=activation_post, causal=causal, fixed_filter=False)
+        elif h.activation == "snakebeta":  # periodic nonlinearity with snakebeta function and anti-aliasing
             activation_post = SnakeBeta(ch, alpha_logscale=h.snake_logscale)
-            self.activation_post = Activation1d(
-                activation=activation_post, causal=causal, fixed_filter=False
-            )
+            self.activation_post = Activation1d(activation=activation_post, causal=causal, fixed_filter=False)
         else:
             raise NotImplementedError(
                 "activation incorrectly specified. check the config file and look for 'activation'."
             )
 
-        self.conv_post = weight_norm(
-            Conv1d(ch, 1, 7, 1, causal=causal, bias=h.get("use_bias_at_final", True))
-        )
+        self.conv_post = weight_norm(Conv1d(ch, 1, 7, 1, causal=causal, bias=h.get("use_bias_at_final", True)))
 
         # weight initialization
         for i in range(len(self.ups)):
@@ -1157,11 +1071,7 @@ class Decoder(nn.Module):
     @staticmethod
     def _conv1d_left_context(layer) -> int:
         dilation = layer.dilation[0] if isinstance(layer.dilation, tuple) else layer.dilation
-        kernel_size = (
-            layer.kernel_size[0]
-            if isinstance(layer.kernel_size, tuple)
-            else layer.kernel_size
-        )
+        kernel_size = layer.kernel_size[0] if isinstance(layer.kernel_size, tuple) else layer.kernel_size
         if getattr(layer, "causal", False):
             return dilation * (kernel_size - 1)
         return layer.padding[0] if isinstance(layer.padding, tuple) else layer.padding
@@ -1169,11 +1079,7 @@ class Decoder(nn.Module):
     @staticmethod
     def _convtranspose1d_left_context(layer) -> int:
         stride = layer.stride[0] if isinstance(layer.stride, tuple) else layer.stride
-        kernel_size = (
-            layer.kernel_size[0]
-            if isinstance(layer.kernel_size, tuple)
-            else layer.kernel_size
-        )
+        kernel_size = layer.kernel_size[0] if isinstance(layer.kernel_size, tuple) else layer.kernel_size
         if not getattr(layer, "causal", False):
             raise NotImplementedError("Streaming only supports causal ConvTranspose1d.")
         if kernel_size != 2 * stride:
@@ -1221,10 +1127,7 @@ class Decoder(nn.Module):
         if isinstance(block, AMPBlock2):
             left_context = 0
             for conv, activation in zip(block.convs, block.activations, strict=True):
-                left_context += (
-                    cls._activation_left_context(activation)
-                    + cls._conv1d_left_context(conv)
-                )
+                left_context += cls._activation_left_context(activation) + cls._conv1d_left_context(conv)
             return left_context
         raise TypeError(f"Unsupported resblock type: {type(block).__name__}.")
 
@@ -1233,22 +1136,13 @@ class Decoder(nn.Module):
         current_scale = Fraction(1, 1)
         for stage_idx, upsample_layers in enumerate(self.ups):
             for upsample in upsample_layers:
-                left_context += current_scale * self._convtranspose1d_left_context(
-                    upsample
-                )
-                stride = (
-                    upsample.stride[0]
-                    if isinstance(upsample.stride, tuple)
-                    else upsample.stride
-                )
+                left_context += current_scale * self._convtranspose1d_left_context(upsample)
+                stride = upsample.stride[0] if isinstance(upsample.stride, tuple) else upsample.stride
                 current_scale /= int(stride)
 
             stage_start = stage_idx * self.num_kernels
             stage_end = stage_start + self.num_kernels
-            stage_context = max(
-                self._ampblock_left_context(block)
-                for block in self.resblocks[stage_start:stage_end]
-            )
+            stage_context = max(self._ampblock_left_context(block) for block in self.resblocks[stage_start:stage_end])
             left_context += current_scale * stage_context
 
         left_context += current_scale * self._activation_left_context(self.activation_post)
@@ -1311,9 +1205,7 @@ class AudioVAE(nn.Module):
             kernel_size=1,
             stride=1,
         )
-        self.post_proj = Conv1d(
-            in_channels=h.latent_dim, out_channels=h.latent_dim, kernel_size=1, stride=1
-        )
+        self.post_proj = Conv1d(in_channels=h.latent_dim, out_channels=h.latent_dim, kernel_size=1, stride=1)
 
         self.decoder = Decoder(h)
 
@@ -1336,15 +1228,11 @@ class AudioVAE(nn.Module):
 
     def inference_from_latents(self, x, do_sample=True, noise_scale=1.0):
         if do_sample:
-            assert x.size(1) == self.h.latent_dim * 2, (
-                f"Input must be like [B, D, H], got {x.shape}"
-            )
+            assert x.size(1) == self.h.latent_dim * 2, f"Input must be like [B, D, H], got {x.shape}"
             m_q, logs_q = torch.split(x, self.h.latent_dim, dim=1)
             x = m_q + torch.randn_like(m_q) * torch.exp(logs_q) * noise_scale
         else:
-            assert x.size(1) == self.h.latent_dim, (
-                f"Input must be like [B, D, H], got {x.shape}"
-            )
+            assert x.size(1) == self.h.latent_dim, f"Input must be like [B, D, H], got {x.shape}"
         x = self.post_proj(x)
         x = x.permute(0, 2, 1)
         x = self.dec_mi_layer(x)
@@ -1354,13 +1242,10 @@ class AudioVAE(nn.Module):
     def _validate_stream_latents(self, latents: torch.Tensor) -> None:
         if latents.ndim != 3:
             raise ValueError(
-                "Streaming latents must have shape [batch, latent_dim, frames], "
-                f"got {tuple(latents.shape)}."
+                f"Streaming latents must have shape [batch, latent_dim, frames], got {tuple(latents.shape)}."
             )
         if latents.size(1) != self.h.latent_dim:
-            raise ValueError(
-                f"Streaming latent_dim must be {self.h.latent_dim}, got {latents.size(1)}."
-            )
+            raise ValueError(f"Streaming latent_dim must be {self.h.latent_dim}, got {latents.size(1)}.")
 
     def init_stream_state(
         self,
@@ -1397,9 +1282,7 @@ class AudioVAE(nn.Module):
         x = self.post_proj(latents)
         x = x.permute(0, 2, 1)
         x = self.dec_mi_layer[0](x)
-        x, lstm_hidden = self.dec_mi_layer[1].stream_step(
-            x, lstm_hidden
-        )
+        x, lstm_hidden = self.dec_mi_layer[1].stream_step(x, lstm_hidden)
         x = self.dec_mi_layer[2](x)
         decoder_dtype = self.decoder.conv_pre.weight.dtype
         return x.permute(0, 2, 1).to(dtype=decoder_dtype), lstm_hidden
@@ -1425,9 +1308,7 @@ class AudioVAE(nn.Module):
             window = window.to(dtype=decoder_input.dtype)
         chunk_size = int(decoder_input.size(-1))
         if chunk_size >= window.size(-1):
-            raise ValueError(
-                f"decoder window size {window.size(-1)} must be larger than chunk_size {chunk_size}."
-            )
+            raise ValueError(f"decoder window size {window.size(-1)} must be larger than chunk_size {chunk_size}.")
         positions = torch.arange(
             window.size(-1),
             device=window.device,
@@ -1466,9 +1347,7 @@ class AudioVAE(nn.Module):
         decoder_state = state.decoder
         chunk_size = int(decoder_input.size(-1))
         if chunk_size != decoder_state.chunk_size:
-            raise ValueError(
-                f"Streaming chunk_size must stay fixed at {decoder_state.chunk_size}, got {chunk_size}."
-            )
+            raise ValueError(f"Streaming chunk_size must stay fixed at {decoder_state.chunk_size}, got {chunk_size}.")
         window = decoder_state.window
         valid_frames = min(decoder_state.total_frames, window.size(-1))
         valid_frames_tensor = window.new_tensor(valid_frames, dtype=torch.int64)
@@ -1516,9 +1395,7 @@ class AudioVAE(nn.Module):
     ) -> torch.Tensor:
         decoder_state = state.decoder
         stable_end = (
-            decoder_state.total_frames
-            if final
-            else max(0, decoder_state.total_frames - self.decoder.stream_lookahead)
+            decoder_state.total_frames if final else max(0, decoder_state.total_frames - self.decoder.stream_lookahead)
         )
         if stable_end <= decoder_state.emitted_frames:
             return _empty_chunk(audio_window, channels=1)
@@ -1527,9 +1404,7 @@ class AudioVAE(nn.Module):
         valid_frames = min(decoder_state.total_frames, window_size)
         window_start = decoder_state.total_frames - valid_frames
         if decoder_state.emitted_frames < window_start:
-            raise RuntimeError(
-                "Decoder stream window is too short for fixed-graph decoding."
-            )
+            raise RuntimeError("Decoder stream window is too short for fixed-graph decoding.")
 
         local_start = decoder_state.emitted_frames - window_start
         local_end = stable_end - window_start

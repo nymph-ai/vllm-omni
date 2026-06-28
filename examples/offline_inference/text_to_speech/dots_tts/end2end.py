@@ -47,13 +47,6 @@ def parse_args():
         help="Override the deploy config path. If unset, auto-loads "
         "vllm_omni/deploy/dots_tts.yaml based on the HF model_type.",
     )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=None,
-        help="Set torch.manual_seed for deterministic DiT noise "
-        "(default: no seed; used for hidden-dump diagnostics).",
-    )
     return parser.parse_args()
 
 
@@ -67,16 +60,10 @@ def extract_audio(multimodal_output: dict) -> torch.Tensor:
     if audio is None:
         audio = multimodal_output.get("audio")
     if audio is None:
-        raise ValueError(
-            f"No audio key in multimodal_output: {list(multimodal_output.keys())}"
-        )
+        raise ValueError(f"No audio key in multimodal_output: {list(multimodal_output.keys())}")
 
     if isinstance(audio, list):
-        valid = [
-            torch.as_tensor(a).float().cpu().reshape(-1)
-            for a in audio
-            if a is not None
-        ]
+        valid = [torch.as_tensor(a).float().cpu().reshape(-1) for a in audio if a is not None]
         if not valid:
             raise ValueError("Audio list is empty or all elements are None.")
         return torch.cat(valid, dim=0) if len(valid) > 1 else valid[0]
@@ -86,9 +73,6 @@ def extract_audio(multimodal_output: dict) -> torch.Tensor:
 
 def main():
     args = parse_args()
-
-    if args.seed is not None:
-        torch.manual_seed(args.seed)
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -126,17 +110,19 @@ def main():
 
     print(f"\n[mm dump] keys: {list(mm.keys())}")
     for k, v in mm.items():
-        if hasattr(v, 'shape'):
+        if hasattr(v, "shape"):
             print(f"  {k}: shape={tuple(v.shape)} dtype={v.dtype}")
         elif isinstance(v, list):
             print(f"  {k}: list[{len(v)}], first={type(v[0]).__name__}")
         else:
             print(f"  {k}: {type(v).__name__} = {v}")
-    print(f"[audio after extract] shape={tuple(audio.shape)} samples={audio.numel()} rms={audio.float().pow(2).mean().sqrt().item():.4f} max={audio.abs().max().item():.4f}")
+    print(
+        f"[audio after extract] shape={tuple(audio.shape)} samples={audio.numel()} rms={audio.float().pow(2).mean().sqrt().item():.4f} max={audio.abs().max().item():.4f}"
+    )
     n_patches = audio.numel() // 7680
     print(f"[per-patch rms before sf.write] n={n_patches}")
     for i in range(min(8, n_patches)):
-        c = audio[i*7680:(i+1)*7680].float()
+        c = audio[i * 7680 : (i + 1) * 7680].float()
         print(f"  patch {i}: rms={c.pow(2).mean().sqrt().item():.4f} max={c.abs().max().item():.4f}")
 
     duration = audio.numel() / SAMPLE_RATE

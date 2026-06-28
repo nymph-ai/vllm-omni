@@ -38,7 +38,6 @@ import torchaudio.compliance.kaldi as Kaldi
 import torchaudio.functional as AF
 from torch.nn.utils.rnn import pad_sequence
 
-
 # ============================================================================
 # Constants (from modules/speaker/fbank.py)
 # ============================================================================
@@ -78,9 +77,7 @@ def extract_fbank(
     elif waveform.ndim == 2:
         feature_input = waveform if waveform.size(0) == 1 else waveform[0:1, :]
     else:
-        raise ValueError(
-            f"FBank expects a 1D or 2D waveform, got shape {tuple(waveform.shape)}."
-        )
+        raise ValueError(f"FBank expects a 1D or 2D waveform, got shape {tuple(waveform.shape)}.")
     features = Kaldi.fbank(
         feature_input,
         num_mel_bins=n_mels,
@@ -169,9 +166,7 @@ class TDNNLayer(nn.Module):
     ):
         super().__init__()
         if padding < 0:
-            assert kernel_size % 2 == 1, (
-                f"Expect equal paddings, but got even kernel size ({kernel_size})"
-            )
+            assert kernel_size % 2 == 1, f"Expect equal paddings, but got even kernel size ({kernel_size})"
             padding = (kernel_size - 1) // 2 * dilation
         self.linear = nn.Conv1d(
             in_channels,
@@ -249,9 +244,7 @@ class CAMDenseTDNNLayer(nn.Module):
         memory_efficient=False,
     ):
         super().__init__()
-        assert kernel_size % 2 == 1, (
-            f"Expect equal paddings, but got even kernel size ({kernel_size})"
-        )
+        assert kernel_size % 2 == 1, f"Expect equal paddings, but got even kernel size ({kernel_size})"
         padding = (kernel_size - 1) // 2 * dilation
         self.memory_efficient = memory_efficient
         self.nonlinear1 = get_nonlinear(config_str, in_channels)
@@ -314,9 +307,7 @@ class CAMDenseTDNNBlock(nn.ModuleList):
 
 
 class TransitLayer(nn.Module):
-    def __init__(
-        self, in_channels, out_channels, bias=True, config_str="batchnorm-relu"
-    ):
+    def __init__(self, in_channels, out_channels, bias=True, config_str="batchnorm-relu"):
         super().__init__()
         self.nonlinear = get_nonlinear(config_str, in_channels)
         self.linear = nn.Conv1d(in_channels, out_channels, 1, bias=bias)
@@ -327,9 +318,7 @@ class TransitLayer(nn.Module):
 
 
 class DenseLayer(nn.Module):
-    def __init__(
-        self, in_channels, out_channels, bias=False, config_str="batchnorm-relu"
-    ):
+    def __init__(self, in_channels, out_channels, bias=False, config_str="batchnorm-relu"):
         super().__init__()
         self.linear = nn.Conv1d(in_channels, out_channels, 1, bias=bias)
         self.nonlinear = get_nonlinear(config_str, out_channels)
@@ -347,13 +336,9 @@ class BasicResBlock(nn.Module):
 
     def __init__(self, in_planes, planes, stride=1):
         super().__init__()
-        self.conv1 = nn.Conv2d(
-            in_planes, planes, kernel_size=3, stride=(stride, 1), padding=1, bias=False
-        )
+        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=(stride, 1), padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(planes)
-        self.conv2 = nn.Conv2d(
-            planes, planes, kernel_size=3, stride=1, padding=1, bias=False
-        )
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(planes)
 
         self.shortcut = nn.Sequential()
@@ -393,17 +378,13 @@ class FCM(nn.Module):
     ):
         super().__init__()
         self.in_planes = m_channels
-        self.conv1 = nn.Conv2d(
-            1, m_channels, kernel_size=3, stride=1, padding=1, bias=False
-        )
+        self.conv1 = nn.Conv2d(1, m_channels, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(m_channels)
 
         self.layer1 = self._make_layer(block, m_channels, num_blocks[0], stride=2)
         self.layer2 = self._make_layer(block, m_channels, num_blocks[1], stride=2)
 
-        self.conv2 = nn.Conv2d(
-            m_channels, m_channels, kernel_size=3, stride=(2, 1), padding=1, bias=False
-        )
+        self.conv2 = nn.Conv2d(m_channels, m_channels, kernel_size=3, stride=(2, 1), padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(m_channels)
         self.out_channels = m_channels * (feat_dim // 8)
 
@@ -465,9 +446,7 @@ class CAMPPlus(nn.Module):
             )
         )
         channels = init_channels
-        for i, (num_layers, kernel_size, dilation) in enumerate(
-            zip((12, 24, 16), (3, 3, 3), (1, 2, 2), strict=True)
-        ):
+        for i, (num_layers, kernel_size, dilation) in enumerate(zip((12, 24, 16), (3, 3, 3), (1, 2, 2), strict=True)):
             block = CAMDenseTDNNBlock(
                 num_layers=num_layers,
                 in_channels=channels,
@@ -482,18 +461,14 @@ class CAMPPlus(nn.Module):
             channels = channels + num_layers * growth_rate
             self.xvector.add_module(
                 f"transit{i + 1}",
-                TransitLayer(
-                    channels, channels // 2, bias=False, config_str=config_str
-                ),
+                TransitLayer(channels, channels // 2, bias=False, config_str=config_str),
             )
             channels //= 2
 
         self.xvector.add_module("out_nonlinear", get_nonlinear(config_str, channels))
 
         self.xvector.add_module("stats", StatsPool())
-        self.xvector.add_module(
-            "dense", DenseLayer(channels * 2, embedding_size, config_str="batchnorm_")
-        )
+        self.xvector.add_module("dense", DenseLayer(channels * 2, embedding_size, config_str="batchnorm_"))
 
         for m in self.modules():
             if isinstance(m, (nn.Conv1d, nn.Linear)):
@@ -518,9 +493,7 @@ class CAMPPlus(nn.Module):
         return torch.arange(max_len, device=device).unsqueeze(0) < lengths.unsqueeze(1)
 
     def _masked_stats_pooling(self, x, lengths, unbiased=True, eps=1e-2):
-        lengths = lengths.to(device=x.device, dtype=torch.long).clamp(
-            min=1, max=x.size(-1)
-        )
+        lengths = lengths.to(device=x.device, dtype=torch.long).clamp(min=1, max=x.size(-1))
         mask = self._make_length_mask(lengths, x.size(-1), x.device).unsqueeze(1)
         mask = mask.to(dtype=x.dtype)
 
@@ -528,11 +501,7 @@ class CAMPPlus(nn.Module):
         mean = (x * mask).sum(dim=-1) / denom
 
         centered = (x - mean.unsqueeze(-1)) * mask
-        var_denom = (
-            (lengths - 1).clamp_min(1).to(dtype=x.dtype).view(-1, 1)
-            if unbiased
-            else denom
-        )
+        var_denom = (lengths - 1).clamp_min(1).to(dtype=x.dtype).view(-1, 1) if unbiased else denom
         var = centered.pow(2).sum(dim=-1) / var_denom
         std = torch.sqrt(var.clamp_min(eps))
         return torch.cat([mean, std], dim=1)
@@ -545,11 +514,7 @@ class CAMPPlus(nn.Module):
 
         for name, module in self.xvector.named_children():
             if name == "stats":
-                x = (
-                    self._masked_stats_pooling(x, lengths)
-                    if lengths is not None
-                    else module(x)
-                )
+                x = self._masked_stats_pooling(x, lengths) if lengths is not None else module(x)
                 continue
 
             x = module(x)
@@ -619,9 +584,7 @@ class SpeakerXVectorFeatures(nn.Module):
             min_length=0,
         )
         if self.max_audio_seconds <= 0:
-            return audio, original_lengths, original_lengths, torch.zeros_like(
-                original_lengths
-            )
+            return audio, original_lengths, original_lengths, torch.zeros_like(original_lengths)
 
         max_input_length = round(self.sample_rate * self.max_audio_seconds)
         cropped_audio = []
@@ -631,24 +594,25 @@ class SpeakerXVectorFeatures(nn.Module):
         for index, total_length_tensor in enumerate(original_lengths):
             total_length = int(total_length_tensor.item())
             cropped_length = min(total_length, max_input_length)
-            start = (
-                random.randint(0, total_length - cropped_length)
-                if total_length > cropped_length
-                else 0
-            )
+            start = random.randint(0, total_length - cropped_length) if total_length > cropped_length else 0
             cropped_audio.append(audio[index, start : start + cropped_length])
             cropped_lengths.append(cropped_length)
             starts.append(start)
 
-        return pad_sequence(
-            cropped_audio,
-            batch_first=True,
-            padding_value=0.0,
-        ), original_lengths, torch.tensor(
-            cropped_lengths,
-            device=audio.device,
-            dtype=torch.long,
-        ), torch.tensor(starts, device=audio.device, dtype=torch.long)
+        return (
+            pad_sequence(
+                cropped_audio,
+                batch_first=True,
+                padding_value=0.0,
+            ),
+            original_lengths,
+            torch.tensor(
+                cropped_lengths,
+                device=audio.device,
+                dtype=torch.long,
+            ),
+            torch.tensor(starts, device=audio.device, dtype=torch.long),
+        )
 
     def _crop_fbank(
         self,
@@ -675,9 +639,7 @@ class SpeakerXVectorFeatures(nn.Module):
             end_audio = start_audio + int(cropped_audio_lengths[index].item())
 
             if total_audio_length > 0:
-                start_feat = math.floor(
-                    start_audio * total_feat_length / total_audio_length
-                )
+                start_feat = math.floor(start_audio * total_feat_length / total_audio_length)
                 end_feat = math.ceil(end_audio * total_feat_length / total_audio_length)
             else:
                 start_feat = 0
@@ -701,10 +663,7 @@ class SpeakerXVectorFeatures(nn.Module):
     def _extract_fbank_batch(self, audio, audio_lengths):
         if self.resample is not None:
             audio = self.resample(audio)
-            audio_lengths = torch.ceil(
-                audio_lengths.float()
-                * (_SPEAKER_FBANK_SAMPLE_RATE / self.sample_rate)
-            ).long()
+            audio_lengths = torch.ceil(audio_lengths.float() * (_SPEAKER_FBANK_SAMPLE_RATE / self.sample_rate)).long()
 
         audio_cpu = audio.detach().cpu()
         features = []
@@ -735,21 +694,15 @@ class SpeakerXVectorFeatures(nn.Module):
 
     @torch.no_grad()
     @torch.autocast(enabled=False, device_type="cuda")
-    def forward(
-        self, audio, audio_lengths=None, fbank=None, fbank_lengths=None, **_kwargs
-    ):
+    def forward(self, audio, audio_lengths=None, fbank=None, fbank_lengths=None, **_kwargs):
         self.model.eval()
         audio = audio.float()
         if audio.dim() == 3:
             if audio.size(1) != 1:
-                raise ValueError(
-                    f"Speaker encoder expects mono audio, got shape {tuple(audio.shape)}."
-                )
+                raise ValueError(f"Speaker encoder expects mono audio, got shape {tuple(audio.shape)}.")
             audio = audio[:, 0]
         elif audio.dim() != 2:
-            raise ValueError(
-                f"Speaker encoder expects a 2D or 3D audio tensor, got shape {tuple(audio.shape)}."
-            )
+            raise ValueError(f"Speaker encoder expects a 2D or 3D audio tensor, got shape {tuple(audio.shape)}.")
 
         audio, original_audio_lengths, cropped_audio_lengths, starts = self._crop_audio(
             audio,
@@ -766,7 +719,7 @@ class SpeakerXVectorFeatures(nn.Module):
                 raise TypeError("Speaker encoder expects `fbank` to be a torch.Tensor.")
             if fbank.dim() != 3 or fbank.size(0) != audio.size(0):
                 raise ValueError(
-                    f"Speaker encoder expects `fbank` with shape (B, T, F) and matching batch size, got {tuple(fbank.shape)}."
+                    f"Speaker encoder expects `fbank` with shape (B, T, F) and matching batch size, got {tuple(fbank.shape)}."  # noqa: E501
                 )
             fbank, fbank_lengths = self._crop_fbank(
                 fbank.to(device=audio.device, dtype=torch.float32),

@@ -54,10 +54,7 @@ def build_dots_tts_prompt(
     text_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
 
     audio_gen_start_id = tokenizer.convert_tokens_to_ids(_AUDIO_GEN_START_TOKEN)
-    if (
-        not isinstance(audio_gen_start_id, int)
-        or audio_gen_start_id == tokenizer.unk_token_id
-    ):
+    if not isinstance(audio_gen_start_id, int) or audio_gen_start_id == tokenizer.unk_token_id:
         raise ValueError(
             f"Tokenizer does not know {_AUDIO_GEN_START_TOKEN!r} "
             f"(got id={audio_gen_start_id!r}).  Did you load the "

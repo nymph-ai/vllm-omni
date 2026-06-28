@@ -64,13 +64,11 @@ class TransformerEncoderLayer(nn.Module):
         )
         norm_cls = getattr(nn, norm_layer)
         self.attn_norm = norm_cls(hidden_size)
-        self.ffn = Mlp(
-            hidden_size, ffn_hidden_size, dropout=ffn_dropout, act_layer=nn.SiLU
-        )
+        self.ffn = Mlp(hidden_size, ffn_hidden_size, dropout=ffn_dropout, act_layer=nn.SiLU)
         self.ffn_norm = norm_cls(hidden_size)
         self.hidden_size = hidden_size
 
-    def _build_causal_mask(self, T: int, device):
+    def _build_causal_mask(self, T: int, device):  # noqa: N803
         return torch.tril(torch.ones(T, T, dtype=torch.bool, device=device))
 
     def _build_padding_mask(self, x_lens, max_len: int, device):
@@ -131,9 +129,7 @@ class TransformerEncoderLayer(nn.Module):
         positions: torch.Tensor,
     ):
         if x.size(1) <= 0:
-            raise ValueError(
-                "TransformerEncoderLayer.decode_step expects a non-empty input."
-            )
+            raise ValueError("TransformerEncoderLayer.decode_step expects a non-empty input.")
 
         h = self.attn_norm(x)
         h, cache = self.attn.decode_step(h, cache=cache, positions=positions)
@@ -164,9 +160,7 @@ class SuperviseEncoder(nn.Module):
     def forward(self, x, x_lens=None):
         batch_size, seq_len, _ = x.shape
         if x_lens is None:
-            x_lens = torch.full(
-                (batch_size,), seq_len, device=x.device, dtype=torch.long
-            )
+            x_lens = torch.full((batch_size,), seq_len, device=x.device, dtype=torch.long)
         for layer in self.layers:
             x = layer(x, x_lens=x_lens, causal=self.causal)
         return x
@@ -220,15 +214,11 @@ class VAESemanticEncoder(nn.Module):
         in_ds_rate = 2
         self.patch_size = int(config.patch_size)
         self.in_ds_rate = in_ds_rate
-        self.ds_proj = Conv1d(
-            in_dim, in_dim, kernel_size=in_ds_rate, stride=in_ds_rate, causal=True
-        )
+        self.ds_proj = Conv1d(in_dim, in_dim, kernel_size=in_ds_rate, stride=in_ds_rate, causal=True)
         self.in_proj = nn.Linear(in_dim, config.PatchEncoder.hidden_size)
         self.encoder = SuperviseEncoder(config.PatchEncoder)
         self.out_ds_rate = self.patch_size // in_ds_rate
-        self.out_proj = nn.Linear(
-            config.PatchEncoder.hidden_size * self.out_ds_rate, out_dim
-        )
+        self.out_proj = nn.Linear(config.PatchEncoder.hidden_size * self.out_ds_rate, out_dim)
 
     def forward(self, x, x_lens=None):
         x = self._downsample(x)
@@ -270,13 +260,9 @@ class VAESemanticEncoder(nn.Module):
         state: SemanticEncoderDecodeState,
     ) -> tuple[torch.Tensor, SemanticEncoderDecodeState]:
         if x.ndim != 3:
-            raise ValueError(
-                f"VAESemanticEncoder.prefill expects rank-3 input, got {tuple(x.shape)}."
-            )
+            raise ValueError(f"VAESemanticEncoder.prefill expects rank-3 input, got {tuple(x.shape)}.")
         if x.size(1) % self.patch_size != 0:
-            raise ValueError(
-                f"Prompt latent length {x.size(1)} must be divisible by patch_size={self.patch_size}."
-            )
+            raise ValueError(f"Prompt latent length {x.size(1)} must be divisible by patch_size={self.patch_size}.")
 
         if x.size(1) == 0:
             return (
@@ -284,9 +270,7 @@ class VAESemanticEncoder(nn.Module):
                 state,
             )
         if state.conv_tail.size(0) != x.size(0):
-            raise ValueError(
-                "VAESemanticEncoder.prefill batch size does not match decode state."
-            )
+            raise ValueError("VAESemanticEncoder.prefill batch size does not match decode state.")
 
         step_inputs = self.in_proj(self._downsample(x))
         expected_token_count = (x.size(1) // self.patch_size) * self.out_ds_rate
@@ -305,10 +289,7 @@ class VAESemanticEncoder(nn.Module):
                 f"required={next_seq_len} capacity={cache_capacity}."
             )
 
-        positions = (
-            torch.arange(step_inputs.size(1), device=x.device, dtype=torch.long)
-            + current_seq_len
-        )
+        positions = torch.arange(step_inputs.size(1), device=x.device, dtype=torch.long) + current_seq_len
         encoded = self.encoder.decode_step(
             step_inputs,
             layer_caches=state.layer_caches,
@@ -328,26 +309,18 @@ class VAESemanticEncoder(nn.Module):
         positions: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if latent_patch.ndim != 3:
-            raise ValueError(
-                f"VAESemanticEncoder.decode_patch expects rank-3 input, got {tuple(latent_patch.shape)}."
-            )
+            raise ValueError(f"VAESemanticEncoder.decode_patch expects rank-3 input, got {tuple(latent_patch.shape)}.")
         if latent_patch.size(1) != self.patch_size:
-            raise ValueError(
-                f"decode_patch expects patch length {self.patch_size}, got {latent_patch.size(1)}."
-            )
+            raise ValueError(f"decode_patch expects patch length {self.patch_size}, got {latent_patch.size(1)}.")
         if positions.ndim != 1 or positions.size(0) != self.out_ds_rate:
-            raise ValueError(
-                "decode_patch positions must be a rank-1 tensor matching out_ds_rate."
-            )
+            raise ValueError("decode_patch positions must be a rank-1 tensor matching out_ds_rate.")
 
         step_inputs, conv_tail = self._downsample_step(
             latent_patch,
             conv_tail=conv_tail,
         )
         if step_inputs.size(1) != self.out_ds_rate:
-            raise RuntimeError(
-                f"Downsample step produced {step_inputs.size(1)} tokens, expected {self.out_ds_rate}."
-            )
+            raise RuntimeError(f"Downsample step produced {step_inputs.size(1)} tokens, expected {self.out_ds_rate}.")
 
         encoded = self.encoder.decode_step(
             step_inputs,

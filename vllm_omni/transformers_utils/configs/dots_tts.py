@@ -89,15 +89,9 @@ class DotsTTSConfig(PretrainedConfig):
         self.hidden_size = lm.get("hidden_size", hidden_size)
         self.intermediate_size = lm.get("intermediate_size", intermediate_size)
         self.num_hidden_layers = lm.get("num_hidden_layers", num_hidden_layers)
-        self.num_attention_heads = lm.get(
-            "num_attention_heads", num_attention_heads
-        )
-        self.num_key_value_heads = lm.get(
-            "num_key_value_heads", num_key_value_heads
-        )
-        self.max_position_embeddings = lm.get(
-            "max_position_embeddings", max_position_embeddings
-        )
+        self.num_attention_heads = lm.get("num_attention_heads", num_attention_heads)
+        self.num_key_value_heads = lm.get("num_key_value_heads", num_key_value_heads)
+        self.max_position_embeddings = lm.get("max_position_embeddings", max_position_embeddings)
         self.rms_norm_eps = lm.get("rms_norm_eps", rms_norm_eps)
         self.rope_theta = lm.get("rope_theta", rope_theta)
         self.hidden_act = lm.get("hidden_act", hidden_act)
@@ -109,9 +103,7 @@ class DotsTTSConfig(PretrainedConfig):
         # assertion (if executed) stays vacuous.
         self.use_sliding_window = lm.get("use_sliding_window", False)
         self.sliding_window = lm.get("sliding_window", None)
-        self.max_window_layers = lm.get(
-            "max_window_layers", self.num_hidden_layers
-        )
+        self.max_window_layers = lm.get("max_window_layers", self.num_hidden_layers)
 
     def get_text_config(self, **kwargs):
         """Return self — LM fields are hoisted to top-level attributes."""

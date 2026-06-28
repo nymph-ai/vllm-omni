@@ -49,8 +49,9 @@ from __future__ import annotations
 
 import dataclasses
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -103,13 +104,15 @@ def _build_soar_audio_vae_config() -> AudioVAEConfig:
 
 # Architecture constants (dots.tts-soar; matches _build_soar_*_config defaults).
 # A later step will source these from real HF config (latent_stats.pt + DiT block).
-_FM_HIDDEN = 1024            # DiT.hidden_size  (also LLM↔DiT projection target)
-_LATENT_DIM = 128            # AudioVAE.latent_dim
-_LATENT_PATCH_SIZE = 4       # config.patch_size — DiT samples 4 latent frames / audio patch
-_HIDDEN_PATCH_SIZE = 1       # upstream core.py hardcodes self.hidden_patch_size = 1
-_MAX_AUDIO_PATCHES = 1024    # ~85 s @ 4×1920/48k; bounds per-request FM static buffer
-_DIT_NUM_STEPS = 10          # upstream default num_steps for fixed-step Euler
-_DIT_GUIDANCE_SCALE = 1.2    # upstream default guidance_scale for soar
+_FM_HIDDEN = 1024  # DiT.hidden_size  (also LLM↔DiT projection target)
+_LATENT_DIM = 128  # AudioVAE.latent_dim
+_LATENT_PATCH_SIZE = 4  # config.patch_size — DiT samples 4 latent frames / audio patch
+_HIDDEN_PATCH_SIZE = 1  # upstream core.py hardcodes self.hidden_patch_size = 1
+_MAX_AUDIO_PATCHES = 1024  # ~85 s @ 4×1920/48k; bounds per-request FM static buffer
+_DIT_NUM_STEPS = int(
+    os.environ.get("DOTS_TTS_DIT_NUM_STEPS", "10")
+)  # env-gated; upstream default 10 for fixed-step Euler
+_DIT_GUIDANCE_SCALE = 1.2  # upstream default guidance_scale for soar
 _PATCH_ENCODER_OUT_DS_RATE = 2  # patch_size / in_ds_rate = 4 / 2 (VAESemanticEncoder hardcodes in_ds_rate=2)
 
 
@@ -171,9 +174,9 @@ class _RequestState:
     # _initialize_request_fm_state on first _finish_decode call).  Sized for
     # _MAX_AUDIO_PATCHES × (_HIDDEN_PATCH_SIZE + _LATENT_PATCH_SIZE) = 1024 × 5
     # = 5120 positions.
-    fm_sequence: torch.Tensor | None = None      # [1, fm_capacity, _FM_HIDDEN]
+    fm_sequence: torch.Tensor | None = None  # [1, fm_capacity, _FM_HIDDEN]
     fm_cfg_sequence: torch.Tensor | None = None  # [1, fm_capacity, _FM_HIDDEN]
-    fm_null_g_cond: torch.Tensor | None = None   # [1, _FM_HIDDEN]
+    fm_null_g_cond: torch.Tensor | None = None  # [1, _FM_HIDDEN]
     fm_seq_len: int = 0
     fm_capacity: int = 0
     # Speaker x-vector after _xvec_proj.  V1 zero-shot: None → DiT call
@@ -253,9 +256,7 @@ class _PatchEncoderInner:
 @dataclass
 class _PatchEncoderConfig:
     patch_size: int = 4
-    PatchEncoder: _PatchEncoderInner = dataclasses.field(
-        default_factory=_PatchEncoderInner
-    )
+    PatchEncoder: _PatchEncoderInner = dataclasses.field(default_factory=_PatchEncoderInner)
 
 
 def _build_soar_patch_encoder_config() -> _PatchEncoderConfig:
@@ -267,6 +268,7 @@ class DotsTTSForConditionalGeneration(nn.Module):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
+
         self.vllm_config = vllm_config
         self.config = vllm_config.model_config.hf_config
 
@@ -283,9 +285,7 @@ class DotsTTSForConditionalGeneration(nn.Module):
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "model"),
         )
-        self.make_empty_intermediate_tensors = (
-            self.model.make_empty_intermediate_tensors
-        )
+        self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
 
         self._audio_vae = AudioVAE(_build_soar_audio_vae_config())
         # Upstream serializes vocoder.safetensors with weight_norm folded into
@@ -364,13 +364,29 @@ class DotsTTSForConditionalGeneration(nn.Module):
         self._audio_vae.float()
         self._speaker_encoder.float()
 
+        # === DOTS_TTS_FP32_SIDE patch (Phase 3 (C) experiment) ===
+        # Env-gated: lift the entire DiT + patch_encoder + projector
+        # side-path to fp32 to test whether the step 7+ cos drift
+        # (notes §17, ~0.1-0.6 vs 0.95+ early) is bf16 accumulation.
+        # LLM stays bf16 — only the side path runs fp32.  Production
+        # zero overhead when env var unset.  Cast at the LLM↔side
+        # boundary happens inside _finish_decode.
+        self._fp32_side = bool(os.environ.get("DOTS_TTS_FP32_SIDE"))
+        if self._fp32_side:
+            self._head.float()
+            self._patch_encoder.float()
+            self._hidden_proj.float()
+            self._latent_proj.float()
+            self._coordinate_proj.float()
+            self._xvec_proj.float()
+            self._eos_proj.float()
+        # === end patch ===
+
         # Latent stats — independent of safetensors (torch.load on
         # latent_stats.pt sitting next to the checkpoint files).  Used by
         # _finish_decode to bridge between DiT's normalized latent space and
         # the raw latent space expected by patch_encoder + AudioVAE.
-        latent_stats_path = self._resolve_latent_stats_path(
-            vllm_config.model_config.model
-        )
+        latent_stats_path = self._resolve_latent_stats_path(vllm_config.model_config.model)
         if latent_stats_path is not None:
             self._io_helper = _IOHelper(latent_stats_path)
         else:
@@ -417,11 +433,13 @@ class DotsTTSForConditionalGeneration(nn.Module):
             "audio_vae=AudioVAE, dit=DiT[18L,16H,1024d], "
             "patch_encoder=VAESemanticEncoder[24L,16H,1024d], "
             "5 projectors, speaker_encoder=CAM++[7.2M], "
-            "io_helper=%s, model=%s); vLLM dispatch chain wired end-to-end; "
+            "io_helper=%s, model=%s, fp32_side=%s, dit_steps=%d); vLLM dispatch chain wired end-to-end; "
             "_finish_decode: DiT → denormalize → patch_encoder AR + "
             "AudioVAE decode → wav + eos_proj → stop signal.",
             "loaded" if self._io_helper.global_mean is not None else "identity",
             vllm_config.model_config.model,
+            self._fp32_side,
+            _DIT_NUM_STEPS,
         )
 
     def forward(
@@ -449,7 +467,7 @@ class DotsTTSForConditionalGeneration(nn.Module):
         # in the order preprocess() appended to _pending_requests.
         token_offset = 0
         for req_id, is_prefill, _embeds, span_len in self._pending_requests:
-            req_hidden = output[token_offset:token_offset + span_len]
+            req_hidden = output[token_offset : token_offset + span_len]
             token_offset += span_len
             self._finish_decode(req_id, req_hidden, is_prefill)
 
@@ -478,6 +496,7 @@ class DotsTTSForConditionalGeneration(nn.Module):
             return local
         try:
             from huggingface_hub import hf_hub_download
+
             return hf_hub_download(
                 repo_id=model_arg,
                 filename="latent_stats.pt",
@@ -522,10 +541,7 @@ class DotsTTSForConditionalGeneration(nn.Module):
         # voxcpm2 protocol compatibility: flatten additional_information.
         additional = info_dict.get("additional_information")
         if isinstance(additional, dict):
-            merged = {
-                k: v for k, v in info_dict.items()
-                if k != "additional_information"
-            }
+            merged = {k: v for k, v in info_dict.items() if k != "additional_information"}
             for k, v in additional.items():
                 merged.setdefault(k, v)
             info_dict = merged
@@ -553,7 +569,7 @@ class DotsTTSForConditionalGeneration(nn.Module):
         else:
             curr = state.curr_embed_for_next
             if curr is not None:
-                embeds = curr.to(dev)   # [1, llm_hidden]
+                embeds = curr.to(dev)  # [1, llm_hidden]
             else:
                 # First decode step before AR loop closed — zero fallback.
                 embed_dtype = self.model.embed_tokens.weight.dtype
@@ -622,9 +638,18 @@ class DotsTTSForConditionalGeneration(nn.Module):
         if state is None:
             return
 
+        # Phase 3 (C) boundary cast: lift LLM hidden to fp32 before any
+        # side-path computation, so fm_sequence buffers allocate fp32 on
+        # first call and the entire DiT + projector + patch_encoder chain
+        # stays fp32 end-to-end.  No-op when DOTS_TTS_FP32_SIDE unset.
+        if self._fp32_side:
+            req_hidden = req_hidden.float()
+
         if state.fm_sequence is None:
             self._initialize_request_fm_state(
-                state, device=req_hidden.device, dtype=req_hidden.dtype,
+                state,
+                device=req_hidden.device,
+                dtype=req_hidden.dtype,
             )
 
         # 1. Append last LLM hidden to fm_sequence (+1 position).
@@ -635,12 +660,15 @@ class DotsTTSForConditionalGeneration(nn.Module):
         if _dump_dir:
             os.makedirs(_dump_dir, exist_ok=True)
             _idx = getattr(self, "_dump_idx", 0)
-            torch.save({
-                "hidden": last_hidden.detach().cpu().float(),
-                "shape": list(last_hidden.shape),
-                "dtype": str(last_hidden.dtype),
-                "is_prefill": is_prefill,
-            }, f"{_dump_dir}/step_{_idx:04d}.pt")
+            torch.save(
+                {
+                    "hidden": last_hidden.detach().cpu().float(),
+                    "shape": list(last_hidden.shape),
+                    "dtype": str(last_hidden.dtype),
+                    "is_prefill": is_prefill,
+                },
+                f"{_dump_dir}/step_{_idx:04d}.pt",
+            )
             self._dump_idx = _idx + 1
         # === end patch ===
 
@@ -665,10 +693,14 @@ class DotsTTSForConditionalGeneration(nn.Module):
         if is_prefill:
             if self._beta_trace:
                 self._beta_trace_log(
-                    state, is_prefill=True,
-                    last_hidden=last_hidden, audio_patch=audio_patch,
-                    audio_patch_raw=audio_patch_raw, next_embeds=next_embeds,
-                    wav=None, prob_stop=None,
+                    state,
+                    is_prefill=True,
+                    last_hidden=last_hidden,
+                    audio_patch=audio_patch,
+                    audio_patch_raw=audio_patch_raw,
+                    next_embeds=next_embeds,
+                    wav=None,
+                    prob_stop=None,
                 )
             state.prefill_completed = True
             return
@@ -699,10 +731,14 @@ class DotsTTSForConditionalGeneration(nn.Module):
 
         if self._beta_trace:
             self._beta_trace_log(
-                state, is_prefill=False,
-                last_hidden=last_hidden, audio_patch=audio_patch,
-                audio_patch_raw=audio_patch_raw, next_embeds=next_embeds,
-                wav=wav, prob_stop=eos_logits[0, -1, 1].item(),
+                state,
+                is_prefill=False,
+                last_hidden=last_hidden,
+                audio_patch=audio_patch,
+                audio_patch_raw=audio_patch_raw,
+                next_embeds=next_embeds,
+                wav=wav,
+                prob_stop=eos_logits[0, -1, 1].item(),
             )
 
     def _beta_trace_log(
@@ -719,6 +755,7 @@ class DotsTTSForConditionalGeneration(nn.Module):
     ) -> None:
         """(β) diagnostic — patch label matches output.wav indexing in
         decode rows; prefill row labels itself ``pre``."""
+
         def rmsmax(t: torch.Tensor) -> tuple[float, float]:
             f = t.detach().float()
             return f.pow(2).mean().sqrt().item(), f.abs().max().item()
@@ -762,13 +799,19 @@ class DotsTTSForConditionalGeneration(nn.Module):
         fm_capacity = _MAX_AUDIO_PATCHES * (_HIDDEN_PATCH_SIZE + _LATENT_PATCH_SIZE)
         state.fm_capacity = fm_capacity
         state.fm_sequence = torch.zeros(
-            (1, fm_capacity, _FM_HIDDEN), device=device, dtype=dtype,
+            (1, fm_capacity, _FM_HIDDEN),
+            device=device,
+            dtype=dtype,
         )
         state.fm_cfg_sequence = torch.zeros(
-            (1, fm_capacity, _FM_HIDDEN), device=device, dtype=dtype,
+            (1, fm_capacity, _FM_HIDDEN),
+            device=device,
+            dtype=dtype,
         )
         state.fm_null_g_cond = torch.zeros(
-            (1, _FM_HIDDEN), device=device, dtype=dtype,
+            (1, _FM_HIDDEN),
+            device=device,
+            dtype=dtype,
         )
         state.fm_seq_len = 0
 
@@ -788,15 +831,9 @@ class DotsTTSForConditionalGeneration(nn.Module):
         null_projected = self._hidden_proj(torch.zeros_like(last_hidden))
         end = state.fm_seq_len + projected.size(1)
         if end > state.fm_capacity:
-            raise RuntimeError(
-                f"FM buffer overflow on hidden append: end={end} cap={state.fm_capacity}"
-            )
-        state.fm_sequence[:, state.fm_seq_len:end].copy_(
-            projected.to(state.fm_sequence.dtype)
-        )
-        state.fm_cfg_sequence[:, state.fm_seq_len:end].copy_(
-            null_projected.to(state.fm_cfg_sequence.dtype)
-        )
+            raise RuntimeError(f"FM buffer overflow on hidden append: end={end} cap={state.fm_capacity}")
+        state.fm_sequence[:, state.fm_seq_len : end].copy_(projected.to(state.fm_sequence.dtype))
+        state.fm_cfg_sequence[:, state.fm_seq_len : end].copy_(null_projected.to(state.fm_cfg_sequence.dtype))
         state.fm_seq_len = end
 
     def _append_history_chunk(
@@ -814,15 +851,9 @@ class DotsTTSForConditionalGeneration(nn.Module):
         history_latent = self._latent_proj(latent_chunk)
         end = state.fm_seq_len + history_latent.size(1)
         if end > state.fm_capacity:
-            raise RuntimeError(
-                f"FM buffer overflow on latent append: end={end} cap={state.fm_capacity}"
-            )
-        state.fm_sequence[:, state.fm_seq_len:end].copy_(
-            history_latent.to(state.fm_sequence.dtype)
-        )
-        state.fm_cfg_sequence[:, state.fm_seq_len:end].copy_(
-            history_latent.to(state.fm_cfg_sequence.dtype)
-        )
+            raise RuntimeError(f"FM buffer overflow on latent append: end={end} cap={state.fm_capacity}")
+        state.fm_sequence[:, state.fm_seq_len : end].copy_(history_latent.to(state.fm_sequence.dtype))
+        state.fm_cfg_sequence[:, state.fm_seq_len : end].copy_(history_latent.to(state.fm_cfg_sequence.dtype))
         state.fm_seq_len = end
 
     def _build_fm_attn_mask(
@@ -844,15 +875,11 @@ class DotsTTSForConditionalGeneration(nn.Module):
         latent_start = total_len - _LATENT_PATCH_SIZE
         block_start = state.fm_seq_len - _HIDDEN_PATCH_SIZE
         if block_start > 0:
-            causal_mask = (
-                torch.ones((block_start, block_start), device=device, dtype=torch.bool)
-                .triu(1)
-                .logical_not()
-            )
+            causal_mask = torch.ones((block_start, block_start), device=device, dtype=torch.bool).triu(1).logical_not()
             attn_mask[:, :block_start, :block_start] = causal_mask
-        attn_mask[:, block_start:state.fm_seq_len, :state.fm_seq_len] = True
-        attn_mask[:, block_start:state.fm_seq_len, latent_start:] = True
-        attn_mask[:, latent_start:, :state.fm_seq_len] = True
+        attn_mask[:, block_start : state.fm_seq_len, : state.fm_seq_len] = True
+        attn_mask[:, block_start : state.fm_seq_len, latent_start:] = True
+        attn_mask[:, latent_start:, : state.fm_seq_len] = True
         attn_mask[:, latent_start:, latent_start:] = True
         if latent_start > state.fm_seq_len:
             padding_indices = torch.arange(state.fm_seq_len, latent_start, device=device)
@@ -873,13 +900,16 @@ class DotsTTSForConditionalGeneration(nn.Module):
         pos_ids = torch.zeros((1, total_len), device=device, dtype=torch.float32)
         latent_start = total_len - _LATENT_PATCH_SIZE
         if state.fm_seq_len > 0:
-            pos_ids[:, :state.fm_seq_len] = torch.arange(
-                state.fm_seq_len, device=device, dtype=pos_ids.dtype,
+            pos_ids[:, : state.fm_seq_len] = torch.arange(
+                state.fm_seq_len,
+                device=device,
+                dtype=pos_ids.dtype,
             )
         pos_ids[:, latent_start:] = torch.arange(
             state.fm_seq_len,
             state.fm_seq_len + _LATENT_PATCH_SIZE,
-            device=device, dtype=pos_ids.dtype,
+            device=device,
+            dtype=pos_ids.dtype,
         )
         return pos_ids
 
@@ -912,9 +942,9 @@ class DotsTTSForConditionalGeneration(nn.Module):
 
         # Workspace: committed history + 4 noise slots (overwritten per step).
         input_sequence = torch.zeros((1, total_len, _FM_HIDDEN), device=device, dtype=dtype)
-        input_sequence[:, :state.fm_seq_len] = state.fm_sequence[:, :state.fm_seq_len]
+        input_sequence[:, : state.fm_seq_len] = state.fm_sequence[:, : state.fm_seq_len]
         cfg_sequence = torch.zeros((1, total_len, _FM_HIDDEN), device=device, dtype=dtype)
-        cfg_sequence[:, :state.fm_seq_len] = state.fm_cfg_sequence[:, :state.fm_seq_len]
+        cfg_sequence[:, : state.fm_seq_len] = state.fm_cfg_sequence[:, : state.fm_seq_len]
 
         attn_mask = self._build_fm_attn_mask(state, total_len, device)
         pos_ids = self._build_fm_pos_ids(state, total_len, device)
@@ -1071,14 +1101,8 @@ class DotsTTSForConditionalGeneration(nn.Module):
             else:
                 logger.info("[β-emit] mm empty / no model_outputs")
             mo_kind = type(model_outputs).__name__
-            mo_info = (
-                f"shape={tuple(model_outputs.shape)}"
-                if hasattr(model_outputs, "shape")
-                else "no_shape"
-            )
-            logger.info(
-                f"[β-emit] text_hidden_states arg: {mo_kind} {mo_info}"
-            )
+            mo_info = f"shape={tuple(model_outputs.shape)}" if hasattr(model_outputs, "shape") else "no_shape"
+            logger.info(f"[β-emit] text_hidden_states arg: {mo_kind} {mo_info}")
 
         return OmniOutput(text_hidden_states=model_outputs, multimodal_outputs=mm)
 
@@ -1137,9 +1161,7 @@ class DotsTTSForConditionalGeneration(nn.Module):
 
         return logits
 
-    def load_weights(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
-    ) -> set[str]:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load all dots.tts checkpoint weights — step 6b.
 
         Routing branches in a single pass over the input iterator (it can only
@@ -1172,19 +1194,14 @@ class DotsTTSForConditionalGeneration(nn.Module):
 
         # (top-level prefix in checkpoint, local attr name, local nn.Module)
         projector_specs: list[tuple[str, str, nn.Module]] = [
-            ("hidden_proj.",     "_hidden_proj",     self._hidden_proj),
-            ("latent_proj.",     "_latent_proj",     self._latent_proj),
+            ("hidden_proj.", "_hidden_proj", self._hidden_proj),
+            ("latent_proj.", "_latent_proj", self._latent_proj),
             ("coordinate_proj.", "_coordinate_proj", self._coordinate_proj),
-            ("xvec_proj.",       "_xvec_proj",       self._xvec_proj),
-            ("eos_proj.",        "_eos_proj",        self._eos_proj),
+            ("xvec_proj.", "_xvec_proj", self._xvec_proj),
+            ("eos_proj.", "_eos_proj", self._eos_proj),
         ]
-        projector_state_keys = {
-            prefix: set(mod.state_dict().keys())
-            for prefix, _, mod in projector_specs
-        }
-        projector_matched: dict[str, list[tuple[str, torch.Tensor]]] = {
-            prefix: [] for prefix, _, _ in projector_specs
-        }
+        projector_state_keys = {prefix: set(mod.state_dict().keys()) for prefix, _, mod in projector_specs}
+        projector_matched: dict[str, list[tuple[str, torch.Tensor]]] = {prefix: [] for prefix, _, _ in projector_specs}
 
         matched_vae: list[tuple[str, torch.Tensor]] = []
         matched_dit: list[tuple[str, torch.Tensor]] = []
@@ -1199,12 +1216,12 @@ class DotsTTSForConditionalGeneration(nn.Module):
         LLM_LM_HEAD_PREFIX = "llm.lm_head."
         for name, tensor in weights:
             if name.startswith(DIT_PREFIX):
-                candidate = name[len(DIT_PREFIX):]
+                candidate = name[len(DIT_PREFIX) :]
                 if candidate in dit_state_keys:
                     matched_dit.append((candidate, tensor))
                 continue
             if name.startswith(PATCH_PREFIX):
-                candidate = name[len(PATCH_PREFIX):]
+                candidate = name[len(PATCH_PREFIX) :]
                 if candidate in patch_state_keys:
                     matched_patch.append((candidate, tensor))
                 continue
@@ -1214,7 +1231,7 @@ class DotsTTSForConditionalGeneration(nn.Module):
                 skipped_lm_head += 1
                 continue
             if name.startswith(LLM_MODEL_PREFIX):
-                candidate = name[len(LLM_MODEL_PREFIX):]
+                candidate = name[len(LLM_MODEL_PREFIX) :]
                 # Hand off untouched — Qwen2Model.load_weights does its own
                 # fusion (q/k/v_proj -> qkv_proj, gate/up_proj -> gate_up_proj)
                 # and tolerates unknown keys, so no local key set to gate.
@@ -1224,7 +1241,7 @@ class DotsTTSForConditionalGeneration(nn.Module):
             hit_projector = False
             for prefix, _attr, _mod in projector_specs:
                 if name.startswith(prefix):
-                    candidate = name[len(prefix):]
+                    candidate = name[len(prefix) :]
                     if candidate in projector_state_keys[prefix]:
                         projector_matched[prefix].append((candidate, tensor))
                     hit_projector = True
@@ -1237,9 +1254,7 @@ class DotsTTSForConditionalGeneration(nn.Module):
             if name in speaker_state_keys:
                 matched_speaker.append((name, tensor))
                 continue
-            candidate = (
-                name[len("vocoder."):] if name.startswith("vocoder.") else name
-            )
+            candidate = name[len("vocoder.") :] if name.startswith("vocoder.") else name
             if candidate in vae_state_keys:
                 matched_vae.append((candidate, tensor))
 
@@ -1299,8 +1314,7 @@ class DotsTTSForConditionalGeneration(nn.Module):
             loaded_llm = self.model.load_weights(iter(matched_llm))
             loaded.update(f"model.{name}" for name in loaded_llm)
             logger.info(
-                "DotsTTS step-7e-r3c: loaded %d Qwen2 tensors (fed %d; "
-                "%d llm.lm_head.* skipped — tied embeddings).",
+                "DotsTTS step-7e-r3c: loaded %d Qwen2 tensors (fed %d; %d llm.lm_head.* skipped — tied embeddings).",
                 len(loaded_llm),
                 len(matched_llm),
                 skipped_lm_head,
