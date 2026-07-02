@@ -463,13 +463,21 @@ class DotsTTSForConditionalGeneration(nn.Module):
         if isinstance(output, tuple):
             output = output[0]
 
-        # Per-request side-path: slice scaffold_hidden by token span_len
-        # in the order preprocess() appended to _pending_requests.
+        # Side-path: slice scaffold_hidden by token span_len in the order
+        # preprocess() appended to _pending_requests. One request -> the
+        # validated single path; multiple in-flight -> the batched side-path
+        # (one DiT-euler + one VAE-decode across requests = the render-farm).
+        reqs = []
         token_offset = 0
         for req_id, is_prefill, _embeds, span_len in self._pending_requests:
             req_hidden = output[token_offset : token_offset + span_len]
             token_offset += span_len
-            self._finish_decode(req_id, req_hidden, is_prefill)
+            reqs.append((req_id, req_hidden, is_prefill))
+        if len(reqs) == 1:
+            rid, rh, ip = reqs[0]
+            self._finish_decode(rid, rh, ip)
+        elif len(reqs) > 1:
+            self._finish_decode_batched(reqs)
 
         # End-of-step cleanup
         self._pending_requests.clear()
@@ -989,6 +997,142 @@ class DotsTTSForConditionalGeneration(nn.Module):
                 velocity = vt_c + guidance_scale * (vt_c - vt_u)
                 z = z + velocity * dt
         return z
+
+    # ── render-farm: cross-request batched side-path (DiT euler + VAE decode) ──
+    # PR #4765 ran the side-path per-request (forward() loop), so concurrency
+    # regressed (the DiT/VAE serialized). The DiT recomputes full attention every
+    # euler step (no incremental KV), so M requests batch cleanly: pad each
+    # request's fm_sequence to a common max_hist, place the noise patch at a fixed
+    # tail, and give each request its own attention mask (padding fully masked) so
+    # per-request attention stays independent (bit-exact vs the single path).
+
+    def _build_fm_attn_mask_batched(self, states, latent_start, total_len, device):
+        m = len(states)
+        attn_mask = torch.zeros((m, total_len, total_len), device=device, dtype=torch.bool)
+        for i, s in enumerate(states):
+            fsl = s.fm_seq_len
+            block_start = fsl - _HIDDEN_PATCH_SIZE
+            if block_start > 0:
+                causal = torch.ones((block_start, block_start), device=device, dtype=torch.bool).triu(1).logical_not()
+                attn_mask[i, :block_start, :block_start] = causal
+            attn_mask[i, block_start:fsl, :fsl] = True
+            attn_mask[i, block_start:fsl, latent_start:] = True
+            attn_mask[i, latent_start:, :fsl] = True
+            attn_mask[i, latent_start:, latent_start:] = True
+            # padding rows [fsl:latent_start] self-attend so SDPA sees no all-masked row (NaN guard)
+            if latent_start > fsl:
+                idx = torch.arange(fsl, latent_start, device=device)
+                attn_mask[i, idx, idx] = True
+        return attn_mask
+
+    def _build_fm_pos_ids_batched(self, states, latent_start, total_len, device):
+        m = len(states)
+        pos_ids = torch.zeros((m, total_len), device=device, dtype=torch.float32)
+        for i, s in enumerate(states):
+            fsl = s.fm_seq_len
+            if fsl > 0:
+                pos_ids[i, :fsl] = torch.arange(fsl, device=device, dtype=pos_ids.dtype)
+            pos_ids[i, latent_start:] = torch.arange(fsl, fsl + _LATENT_PATCH_SIZE, device=device, dtype=pos_ids.dtype)
+        return pos_ids
+
+    def _run_dit_n_step_euler_batched(
+        self,
+        states,
+        *,
+        num_steps: int = _DIT_NUM_STEPS,
+        guidance_scale: float = _DIT_GUIDANCE_SCALE,
+    ) -> torch.Tensor:
+        """Batched DiT N-step Euler across M requests → [M, _LATENT_PATCH_SIZE, _LATENT_DIM]."""
+        m = len(states)
+        device = states[0].fm_sequence.device
+        dtype = states[0].fm_sequence.dtype
+        max_hist = max(s.fm_seq_len for s in states)
+        total_len = max_hist + _LATENT_PATCH_SIZE
+        latent_start = max_hist  # fixed noise tail for the whole batch
+
+        input_sequence = torch.zeros((m, total_len, _FM_HIDDEN), device=device, dtype=dtype)
+        cfg_sequence = torch.zeros((m, total_len, _FM_HIDDEN), device=device, dtype=dtype)
+        for i, s in enumerate(states):
+            input_sequence[i, : s.fm_seq_len] = s.fm_sequence[0, : s.fm_seq_len]
+            cfg_sequence[i, : s.fm_seq_len] = s.fm_cfg_sequence[0, : s.fm_seq_len]
+
+        attn_mask = self._build_fm_attn_mask_batched(states, latent_start, total_len, device)
+        pos_ids = self._build_fm_pos_ids_batched(states, latent_start, total_len, device)
+        attn_mask_b = torch.cat([attn_mask, attn_mask], dim=0)  # [2m, L, L] (cond|uncond share mask)
+        pos_ids_b = torch.cat([pos_ids, pos_ids], dim=0)
+
+        g_conds = [(s.g_cond if s.g_cond is not None else s.fm_null_g_cond).to(device=device, dtype=dtype) for s in states]
+        g_cond_c = torch.cat(g_conds, dim=0)  # [m, _FM_HIDDEN]
+        g_cond_batched = torch.cat([g_cond_c, torch.zeros_like(g_cond_c)], dim=0)  # [2m, _FM_HIDDEN]
+
+        z = torch.randn((m, _LATENT_PATCH_SIZE, _LATENT_DIM), device=device, dtype=dtype)
+        dt = 1.0 / num_steps
+        times = torch.linspace(0.0, 1.0, num_steps + 1, device=device, dtype=dtype)
+        use_amp = device.type == "cuda" and dtype in (torch.float16, torch.bfloat16)
+        with torch.autocast(device_type="cuda", dtype=dtype if use_amp else torch.float32, enabled=use_amp):
+            for step in range(num_steps):
+                t = times[step].reshape(1)
+                z_proj = self._coordinate_proj(z)  # [m, _LATENT_PATCH_SIZE, _FM_HIDDEN]
+                z_c = input_sequence.clone(); z_c[:, latent_start:] = z_proj
+                z_u = cfg_sequence.clone(); z_u[:, latent_start:] = z_proj
+                z_batched = torch.cat([z_c, z_u], dim=0)  # [2m, L, _FM_HIDDEN]
+                t_batched = t.repeat(2 * m)
+                vt = self._head(x=z_batched, timesteps=t_batched, attn_mask=attn_mask_b, pos_ids=pos_ids_b, g_cond=g_cond_batched)
+                vt = vt[:, latent_start:]
+                vt_c, vt_u = vt[:m], vt[m:]
+                velocity = vt_c + guidance_scale * (vt_c - vt_u)
+                z = z + velocity * dt
+        return z
+
+    def _finish_decode_batched(self, reqs) -> None:
+        """Batched counterpart of _finish_decode: one DiT-euler + one VAE-decode across all
+        in-flight requests (the render-farm hot path). Per-request patch_encoder loopback +
+        eos are kept per-request (small); prefill requests skip VAE/eos like the single path."""
+        items = []  # (req_id, state, last_hidden, is_prefill)
+        for req_id, req_hidden, is_prefill in reqs:
+            state = self._active_states.get(req_id)
+            if state is None:
+                continue
+            if self._fp32_side:
+                req_hidden = req_hidden.float()
+            if state.fm_sequence is None:
+                self._initialize_request_fm_state(state, device=req_hidden.device, dtype=req_hidden.dtype)
+            last_hidden = req_hidden[-_HIDDEN_PATCH_SIZE:].unsqueeze(0)
+            self._append_hidden_chunk(state, last_hidden)
+            items.append((req_id, state, last_hidden, is_prefill))
+        if not items:
+            return
+
+        z_batch = self._run_dit_n_step_euler_batched([it[1] for it in items])  # [M, 4, LATENT_DIM]
+
+        raws = []
+        for i, (req_id, state, last_hidden, is_prefill) in enumerate(items):
+            audio_patch = z_batch[i : i + 1]
+            self._append_history_chunk(state, audio_patch)
+            audio_patch_raw = self._io_helper.denormalize(audio_patch)
+            next_embeds = self._run_patch_encoder_loopback(state, audio_patch_raw)
+            state.curr_embed_for_next = next_embeds.squeeze(0).detach()
+            raws.append(audio_patch_raw)
+            if is_prefill:
+                state.prefill_completed = True
+
+        decode_idx = [i for i, it in enumerate(items) if not it[3]]
+        if not decode_idx:
+            return
+        # Batched AudioVAE decode: stack [D, 128, 4] -> [D, 1, 7680].
+        batch_raw = torch.cat([raws[i].transpose(1, 2).float() for i in decode_idx], dim=0)
+        wavs = self._audio_vae.inference_from_latents(batch_raw, do_sample=False)
+        # Batched eos: stack last_hidden [D, _HIDDEN_PATCH_SIZE, H].
+        eos_in = torch.cat([items[i][2].detach() for i in decode_idx], dim=0)
+        eos_logits = self._eos_proj(eos_in).softmax(dim=-1)  # [D, _HIDDEN_PATCH_SIZE, 2]
+        for k, i in enumerate(decode_idx):
+            req_id, state = items[i][0], items[i][1]
+            self._audio_queue.append((req_id, wavs[k].reshape(-1)))
+            stop_logits = eos_logits[k, -1]
+            state.precomputed_stop_logits = stop_logits
+            if float(eos_logits[k, -1, 1]) > 0.8:
+                state.is_stopping = True
+            self._results_queue.append((req_id, stop_logits))
 
     def _run_patch_encoder_loopback(
         self,
