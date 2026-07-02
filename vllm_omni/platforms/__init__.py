@@ -7,7 +7,19 @@ from itertools import chain
 from typing import TYPE_CHECKING
 
 from vllm.utils.import_utils import resolve_obj_by_qualname
-from vllm.utils.torch_utils import supports_xccl
+
+try:
+    from vllm.utils.torch_utils import supports_xccl
+except ImportError:
+    # vllm 0.24.0 release dropped this helper (only used by the XPU platform path,
+    # irrelevant on CUDA/ROCm). Fall back to torch's own probe, else False.
+    def supports_xccl() -> bool:  # type: ignore[misc]
+        try:
+            import torch
+
+            return bool(getattr(torch.distributed, "is_xccl_available", lambda: False)())
+        except Exception:
+            return False
 
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
 from vllm_omni.plugins import (
